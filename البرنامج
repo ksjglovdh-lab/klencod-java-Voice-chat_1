@@ -1,0 +1,1067 @@
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+beautifulsoup4==4.12.3
+lxml==5.3.0
+SQLAlchemy==2.0.36
+pydantic==2.10.4
+PyJWT==2.10.1
+python-multipart==0.0.20
+reportlab==4.2.5
+cryptography==44.0.0
+import os
+
+class Settings:
+    SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change-me")
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./codedoctor.db")
+    JWT_ALG = "HS256"
+    TOKEN_HOURS = 12
+
+AI_API_KEY = os.getenv("AI_API_KEY", "")
+    AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
+    AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
+
+MAX_LINKS = int(os.getenv("MAX_LINKS", "20"))
+    MAX_ASSETS = int(os.getenv("MAX_ASSETS", "15"))
+
+settings = Settings()
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from app.config import settings
+
+engine = create_engine(
+    settings.DATABASE_URL,
+    connect_args={"check_same_thread": False}
+    if settings.DATABASE_URL.startswith("sqlite") else {},
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+def init_db():
+    from app import models  # noqa: F401
+    Base.metadata.create_all(bind=engine)
+from datetime import datetime, timezone
+from sqlalchemy import String, Integer, ForeignKey, Text, DateTime
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.database import Base
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(512))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+scans: Mapped[list["Scan"]] = relationship(back_populates="user")
+
+class Scan(Base):
+    __tablename__ = "scans"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    scan_type: Mapped[str] = mapped_column(String(32), default="web")  # web | code_quality
+    url: Mapped[str] = mapped_column(String(1024), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="queued")  # queued|running|completed|failed
+    security_score: Mapped[int] = mapped_column(Integer, default=0)
+    quality_score: Mapped[int] = mapped_column(Integer, default=0)
+    overall_score: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    finished_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+
+user: Mapped[User] = relationship(back_populates="scans")
+    findings: Mapped[list["Finding"]] = relationship(back_populates="scan", cascade="all,delete")
+    logs: Mapped[list["ScanLog"]] = relationship(back_populates="scan", cascade="all,delete")
+
+class Finding(Base):
+    __tablename__ = "findings"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(ForeignKey("scans.id"))
+    ftype: Mapped[str] = mapped_column(String(32))      # security | performance | code_quality
+    severity: Mapped[str] = mapped_column(String(32))   # critical|high|medium|low
+    code: Mapped[str] = mapped_column(String(64))      # مفتاح قاعدة المعرفة
+    evidence: Mapped[str] = mapped_column(Text, default="")
+    location: Mapped[str] = mapped_column(Text, default="")
+
+scan: Mapped[Scan] = relationship(back_populates="findings")
+
+class ScanLog(Base):
+    __tablename__ = "scan_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(ForeignKey("scans.id"))
+    level: Mapped[str] = mapped_column(String(16), default="info")
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+scan: Mapped[Scan] = relationship(back_populates="logs")
+from typing import Optional
+from pydantic import BaseModel, EmailStr, Field, HttpUrl
+
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8)
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+class ScanIn(BaseModel):
+    url: HttpUrl
+    confirm_ownership: bool  # إقرار إلزامي بملكية/تصريح فحص الموقع
+
+class ScanOut(BaseModel):
+    id: int
+    scan_type: str
+    url: Optional[str]
+    status: str
+    security_score: int
+    quality_score: int
+    overall_score: int
+    error: Optional[str] = None
+    created_at: str
+    finished_at: Optional[str] = None
+
+class FindingOut(BaseModel):
+    id: int
+    ftype: str
+    severity: str
+    code: str
+    evidence: str
+    location: str
+
+class ExplainIn(BaseModel):
+    finding_id: int
+    lang: str = "en"  # en | ar
+
+class CompareOut(BaseModel):
+    scan_a: ScanOut
+    scan_b: ScanOut
+    severity_delta: dict
+import hashlib
+import os
+from datetime import datetime, timezone, timedelta
+
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import SessionLocal
+from app.models import User
+from app.schemas import RegisterIn, LoginIn, TokenOut
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+bearer = HTTPBearer(auto_error=False)
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+    return f"{salt.hex()}${dk.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, dk_hex = stored.split("$", 1)
+        dk = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), 200_000
+        )
+        return dk.hex() == dk_hex
+    except ValueError:
+        return False
+
+def create_token(user_id: int) -> str:
+    payload = {
+        "sub": str(user_id),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=settings.TOKEN_HOURS),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALG)
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials = Depends(bearer),
+) -> User:
+    if creds is None:
+        raise HTTPException(401, "Authentication required")
+    try:
+        payload = jwt.decode(creds.credentials, settings.SECRET_KEY, algorithms=[settings.JWT_ALG])
+        user_id = int(payload["sub"])
+    except Exception:
+        raise HTTPException(401, "Invalid or expired token")
+    db: Session = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        if not user:
+            raise HTTPException(401, "User not found")
+        return user
+    finally:
+        db.close()
+
+@router.post("/register", response_model=TokenOut)
+def register(data: RegisterIn):
+    db: Session = SessionLocal()
+    try:
+        if db.query(User).filter(User.email == data.email.lower()).first():
+            raise HTTPException(409, "Email already registered")
+        user = User(email=data.email.lower(), password_hash=hash_password(data.password))
+        db.add(user)
+        db.commit()
+        return TokenOut(access_token=create_token(user.id))
+    finally:
+        db.close()
+
+@router.post("/login", response_model=TokenOut)
+def login(data: LoginIn):
+    db: Session = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == data.email.lower()).first()
+        if not user or not verify_password(data.password, user.password_hash):
+            raise HTTPException(401, "Invalid credentials")
+        return TokenOut(access_token=create_token(user.id))
+    finally:
+        db.close()
+"""طبقة الجلب الآمن: تمنع فحص عناوين داخلية (SSRF) وتحصر الطلبات في HTTP/S."""
+import ipaddress
+import socket
+import ssl
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import httpx
+
+UA = "CodeDoctorAI/1.0 (authorized-scan; passive-checks-only)"
+BLOCKED_NETWORKS = ("private", "loopback", "link_local", "reserved", "multicast")
+
+def validate_public_url(url: str) -> str:
+    p = urlparse(str(url))
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ValueError("Only http(s) URLs are supported")
+    try:
+        infos = socket.getaddrinfo(p.hostname, None)
+    except socket.gaierror:
+        raise ValueError(f"Cannot resolve host: {p.hostname}")
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if any(getattr(ip, attr) for attr in BLOCKED_NETWORKS):
+            raise ValueError(f"Blocked non-public host: {p.hostname}")
+    return str(url)
+
+def fetch(url: str, *, method: str = "GET", origin: str | None = None,
+          timeout: float = 15.0, max_bytes: int = 5_000_000) -> dict:
+    """طلب واحد آمن، غير تخريبي، مع قياس التوقيت. يعيد dict موحّد."""
+    url = validate_public_url(url)
+    headers = {"User-Agent": UA}
+    if origin:
+        headers["Origin"] = origin
+
+t0 = time.perf_counter()
+    with httpx.Client(timeout=timeout, verify=True, follow_redirects=True) as client:
+        with client.stream(method, url, headers=headers) as r:
+            ttfb_ms = int((time.perf_counter() - t0) * 1000)
+            body = b"" if method == "HEAD" else r.read()
+    total_ms = int((time.perf_counter() - t0) * 1000)
+
+if len(body) > max_bytes:
+        body = body[:max_bytes]  # حد أقصى للاستجابة لتفادي سحب ملفات ضخمة
+    return {
+        "status": r.status_code,
+        "headers": r.headers,
+        "text": body.decode("utf-8", errors="replace"),
+        "bytes_len": len(body),
+        "ttfb_ms": ttfb_ms,
+        "total_ms": total_ms,
+        "final_url": str(r.url),
+    }
+
+def ssl_expiry(hostname: str) -> datetime:
+    """تاريخ انتهاء شهادة SSL/TLS للموقع (قراءة سلبية فقط)."""
+    ctx = ssl.create_default_context()
+    with socket.create_connection((hostname, 443), timeout=10) as sock:
+        with ctx.wrap_socket(sock, server_hostname=hostname) as tls:
+            der = tls.getpeercert(binary_form=True)
+    from cryptography import x509
+    cert = x509.load_der_x509_certificate(der)
+    expiry = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
+    return expiry if expiry.tzinfo else expiry.replace(tzinfo=timezone.utc)
+"""فحوصات سلبية غير تخريبية. كل دالة تعيد قائمة نتائج (findings).
+لإضافة فحص جديد: عرّف دالة بنفس التوقيع وأضفها إلى CHECKS."""
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
+
+from bs4 import BeautifulSoup
+
+from app.config import settings
+from app.scanner import fetcher
+
+EXPECTED_HEADERS = [
+    ("strict-transport-security", "MISSING_HSTS", "high"),
+    ("content-security-policy", "NO_CSP", "high"),
+    ("x-frame-options", "XFO_MISSING", "medium"),
+    ("x-content-type-options", "XCTO_MISSING", "medium"),
+    ("referrer-policy", "REFERRER_MISSING", "low"),
+    ("permissions-policy", "PERMISSIONS_MISSING", "low"),
+]
+
+def mk(code, ftype, severity, evidence="", location=""):
+    return {"code": code, "type": ftype, "severity": severity,
+            "evidence": str(evidence)[:800], "location": str(location)[:400]}
+
+def https_ssl_check(url: str, page: dict) -> list[dict]:
+    out = []
+    p = urlparse(url)
+    if p.scheme != "https":
+        out.append(mk("INSECURE_HTTP", "security", "critical",
+                      "The site is served over plain HTTP.", url))
+        return out
+    try:
+        expiry = fetcher.ssl_expiry(p.hostname)
+        days = (expiry - datetime.now(timezone.utc)).days
+        if days < 0:
+            out.append(mk("SSL_EXPIRED", "security", "critical",
+                          f"Certificate expired {-days} days ago.", p.hostname))
+        elif days <= 30:
+            out.append(mk("SSL_EXPIRING", "security", "high",
+                          f"Certificate expires in {days} days.", p.hostname))
+    except Exception as e:
+        out.append(mk("SSL_CHECK_FAILED", "security", "low",
+                      f"Could not read certificate: {e}", p.hostname))
+    return out
+
+def headers_check(url: str, page: dict) -> list[dict]:
+    h, out = page["headers"], []
+    for name, code, sev in EXPECTED_HEADERS:
+        if not h.get(name):
+            out.append(mk(code, "security", sev,
+                          f"Missing header: {name}", page["final_url"]))
+    if h.get("server") and any(c.isdigit() for c in h.get("server", "")):
+        out.append(mk("SERVER_VERSION", "security", "low",
+                      f"Server header leaks version: {h['server']}", page["final_url"]))
+    if h.get("x-powered-by"):
+        out.append(mk("XPOWERED_BY", "security", "low",
+                      f"x-powered-by: {h['x-powered-by']}", page["final_url"]))
+    return out
+
+def cookies_check(url: str, page: dict) -> list[dict]:
+    out = []
+    for raw in page["headers"].get_list("set-cookie"):
+        parts = [p.strip().lower() for p in raw.split(";")]
+        name = parts[0].split("=")[0] or "cookie"
+        if "secure" not in parts:
+            out.append(mk("COOKIE_NO_SECURE", "security", "high", raw, name))
+        if "httponly" not in parts:
+            out.append(mk("COOKIE_NO_HTTPONLY", "security", "medium", raw, name))
+        if not any(p.startswith("samesite") for p in parts):
+            out.append(mk("COOKIE_NO_SAMESITE", "security", "low", raw, name))
+    return out
+
+def cors_check(url: str, page: dict) -> list[dict]:
+    """فحص سلبي آمن لسلوك CORS عبر أصل تحقق واحد لا يوجد تطبيق حقيقي يستخدمه."""
+    try:
+        probe = fetcher.fetch(url, origin="https://codedoctor-probe.invalid.local")
+    except Exception:
+        return []
+    acao = probe["headers"].get("access-control-allow-origin", "")
+    acac = probe["headers"].get("access-control-allow-credentials", "")
+    out = []
+    if acao == "*":
+        sev = "critical" if acac.lower() == "true" else "high"
+        out.append(mk("CORS_WILDCARD", "security", sev,
+                      "Access-Control-Allow-Origin: *", url))
+    elif acao == "https://codedoctor-probe.invalid.local":
+        out.append(mk("CORS_REFLECT", "security", "high",
+                      "Server reflects arbitrary Origin values.", url))
+    return out
+
+def _same_site(base: str, link: str) -> bool:
+    return urlparse(link).hostname == urlparse(base).hostname
+
+def links_check(url: str, page: dict) -> list[dict]:
+    soup = BeautifulSoup(page["text"], "lxml")
+    seen, targets, out = set(), [], []
+    for a in soup.find_all("a", href=True):
+        absu = urljoin(page["final_url"], a["href"])
+        if absu.startswith(("http://", "https://")) and absu not in seen \
+                and _same_site(url, absu):
+            seen.add(absu)
+            targets.append(absu)
+            if len(targets) >= settings.MAX_LINKS:
+                break
+    for t in targets:
+        try:
+            r = fetcher.fetch(t, method="HEAD", timeout=8)
+            ok = r["status"] < 400
+        except Exception:
+            ok = False
+        if not ok:
+            out.append(mk("BROKEN_LINK", "security", "medium", t, t))
+    return out
+
+def assets_check(url: str, page: dict) -> list[dict]:
+    soup = BeautifulSoup(page["text"], "lxml")
+    urls, out = [], []
+    for tag, attr in (("script", "src"), ("img", "src"), ("link", "href")):
+        for el in soup.find_all(tag, **{attr: True}):
+            u = urljoin(page["final_url"], el.get(attr, ""))
+            if u.startswith(("http://", "https://")) and u not in urls:
+                urls.append(u)
+    for u in urls[: settings.MAX_ASSETS]:
+        if u.endswith((".js", ".css", ".png", ".jpg", ".svg", ".webp", ".ico")):
+            try:
+                r = fetcher.fetch(u, method="HEAD", timeout=8)
+                ok = r["status"] < 400
+            except Exception:
+                ok = False
+            if not ok:
+                out.append(mk("BROKEN_ASSET", "security", "high", u, u))
+    if len(urls) > 40:
+        out.append(mk("MANY_REQUESTS", "performance", "medium",
+                      f"{len(urls)} asset URLs referenced on the page.", page["final_url"]))
+    return out
+
+def performance_check(url: str, page: dict) -> list[dict]:
+    out = []
+    if page["ttfb_ms"] > 800:
+        out.append(mk("SLOW_TTFB", "performance", "medium",
+                      f"Time to first byte: {page['ttfb_ms']} ms", page["final_url"]))
+    if page["bytes_len"] > 1_500_000:
+        out.append(mk("LARGE_PAGE", "performance", "medium",
+                      f"HTML size: {page['bytes_len'] / 1_000_000:.1f} MB", page["final_url"]))
+    if page["total_ms"] > 3000:
+        out.append(mk("SLOW_PAGE", "performance", "medium",
+                      f"Full page fetch took {page['total_ms']} ms", page["final_url"]))
+    return out
+
+# السجل القابل للتوسع: أضف دالتك هنا لتظهر تلقائياً في كل فحص
+CHECKS = [https_ssl_check, headers_check, cookies_check, cors_check,
+          links_check, assets_check, performance_check]
+from datetime import datetime, timezone
+
+from app.database import SessionLocal
+from app.models import Scan, Finding, ScanLog
+from app.scanner import fetcher, checks
+
+SEVERITY_PENALTY = {"critical": 25, "high": 12, "medium": 6, "low": 2}
+
+def _log(db, scan_id, message, level="info"):
+    db.add(ScanLog(scan_id=scan_id, level=level, message=message))
+    db.commit()
+
+def _score(findings, ftypes, factor=1.0) -> int:
+    penalty = sum(SEVERITY_PENALTY.get(f["severity"], 2)
+                  for f in findings if f["type"] in ftypes)
+    return max(0, min(100, int(100 - penalty * factor)))
+
+def run_web_scan(scan_id: int, url: str):
+    db = SessionLocal()
+    try:
+        scan = db.get(Scan, scan_id)
+        scan.status, scan.error = "running", None
+        db.commit()
+        _log(db, scan_id, f"Fetching {url}")
+        page = fetcher.fetch(url)
+
+findings: list[dict] = []
+        for check in checks.CHECKS:
+            _log(db, scan_id, f"Running check: {check.__name__}")
+            try:
+                findings += check(url, page)
+            except Exception as e:  # لا تُفشل الفحص كله بسبب فحص واحد
+                _log(db, scan_id, f"{check.__name__} failed: {e}", level="warn")
+
+_save(db, scan_id, findings)
+        scan.security_score = _score(findings, {"security"})
+        scan.quality_score = _score(findings, {"performance", "code_quality"}, factor=0.6)
+        scan.overall_score = int(0.6 * scan.security_score + 0.4 * scan.quality_score)
+        scan.status = "completed"
+        scan.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        _log(db, scan_id, f"Scan completed: {len(findings)} findings")
+    except Exception as e:
+        db.rollback()
+        scan = db.get(Scan, scan_id)
+        scan.status, scan.error = "failed", str(e)
+        db.commit()
+        _log(db, scan_id, f"Scan failed: {e}", level="error")
+    finally:
+        db.close()
+
+def run_code_scan(scan_id: int, zip_path: str):
+    from app.scanner.code_quality import analyze_zip
+    db = SessionLocal()
+    try:
+        scan = db.get(Scan, scan_id)
+        scan.status = "running"
+        db.commit()
+        findings = analyze_zip(zip_path)
+        _save(db, scan_id, findings)
+        scan.security_score = _score(findings, {"security"})
+        scan.quality_score = _score(findings, {"performance", "code_quality"}, factor=0.6)
+        scan.overall_score = int(0.6 * scan.security_score + 0.4 * scan.quality_score)
+        scan.status = "completed"
+        scan.finished_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        scan = db.get(Scan, scan_id)
+        scan.status, scan.error = "failed", str(e)
+        db.commit()
+    finally:
+        db.close()
+
+def _save(db, scan_id: int, findings: list[dict]):
+    for f in findings:
+        db.add(Finding(scan_id=scan_id, ftype=f["type"], severity=f["severity"],
+                       code=f["code"], evidence=f["evidence"], location=f["location"]))
+    db.commit()
+import re
+import zipfile
+
+from app.scanner.checks import mk
+
+TEXT_EXT = (".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".py", ".json", ".env")
+SECRET_PATTERNS = [
+    re.compile(r"AKIA[0-9A-Z]{16}"),                      # AWS access key
+    re.compile(r"-----BEGIN (RSA |EC )?PRIVATE KEY-----"),  # private key
+    re.compile(r"(?i)(api[_-]?key|secret[_-]?key)\s*[:=]\s*['\"][A-Za-z0-9\-_]{16,}['\"]"),
+]
+
+def analyze_zip(zip_path: str) -> list[dict]:
+    findings: list[dict] = []
+    seen: set[tuple] = set()
+
+def add_once(f):
+        key = (f["code"], f["location"])
+        if key not in seen:
+            seen.add(key)
+            findings.append(f)
+
+with zipfile.ZipFile(zip_path) as z:
+        for name in z.namelist():
+            if name.endswith("/") or not name.lower().endswith(TEXT_EXT):
+                continue
+            try:
+                content = z.read(name).decode("utf-8", errors="replace")[:500_000]
+            except Exception:
+                continue
+            lines = content.splitlines()
+
+if len(lines) > 1000:
+                add_once(mk("LONG_FILE", "code_quality", "low",
+                            f"{len(lines)} lines", name))
+            for i, line in enumerate(lines, 1):
+                if "eval(" in line:
+                    add_once(mk("EVAL_USAGE", "security", "high", line.strip()[:120], f"{name}:{i}"))
+                if "document.write(" in line:
+                    add_once(mk("DOC_WRITE", "code_quality", "medium", line.strip()[:120], f"{name}:{i}"))
+                if re.search(r"\.innerHTML\s*=", line):
+                    add_once(mk("INNERHTML", "security", "medium", line.strip()[:120], f"{name}:{i}"))
+                if re.search(r"\bTODO\b|\bFIXME\b", line):
+                    add_once(mk("TODO_MARKS", "code_quality", "low", line.strip()[:120], f"{name}:{i}"))
+                if re.search(r"http://(?!localhost|127\.0\.0\.1)", line):
+                    add_once(mk("HTTP_URL_IN_CODE", "security", "medium", line.strip()[:120], f"{name}:{i}"))
+                for pat in SECRET_PATTERNS:
+                    if pat.search(line):
+                        add_once(mk("HARDCODED_SECRET", "security", "critical",
+                                     "Potential secret detected (value hidden)", f"{name}:{i}"))
+                        break
+
+console_hits = sum(1 for l in lines if "console.log" in l)
+            if console_hits > 10:
+                add_once(mk("CONSOLE_LOGS", "code_quality", "low",
+                            f"{console_hits} console.log statements", name))
+    return findings
+"""المساعد الذكي: يشرح كل خطأ ويحدد موقعه ويقترح كوداً مصححاً وخطوات الحل.
+يعمل محلياً عبر قاعدة معرفة، ويعزز الشرح عبر نموذج لغوي إذا ضُبط AI_API_KEY."""
+import httpx
+
+from app.config import settings
+
+KB = {
+    "INSECURE_HTTP": {
+        "en": {"title": "Site served over HTTP", "cause": "Traffic is unencrypted and can be intercepted or modified.",
+               "fix": "Redirect all HTTP traffic to HTTPS and enable HSTS.", "steps": ["Install/renew a TLS certificate (e.g. Let's Encrypt)", "Add a 301 redirect from port 80 to 443", "Enable HSTS after verifying HTTPS works"]},
+        "ar": {"title": "الموقع يعمل عبر HTTP غير المشفر", "cause": "حركة البيانات غير مشفرة وقابلة للاعتراض أو التعديل.",
+               "fix": "أعد توجيه كل حركة HTTP إلى HTTPS وفعّل HSTS.", "steps": ["ثبّت أو جدّد شهادة TLS (مثل Let's Encrypt)", "أضف توجيه 301 من المنفذ 80 إلى 443", "فعّل HSTS بعد التأكد من عمل HTTPS"]}},
+    "SSL_EXPIRED": {
+        "en": {"title": "Expired TLS certificate", "cause": "Browsers warn users and may block the site.",
+               "fix": "Renew the certificate and automate renewal.", "steps": ["Renew with your CA / certbot", "Set up auto-renewal cron", "Monitor expiry dates"]},
+        "ar": {"title": "شهادة TLS منتهية", "cause": "المتصفحات تحذّر المستخدمين وقد تحجب الموقع.",
+               "fix": "جدّد الشهادة وأتمت عملية التجديد.", "steps": ["جدّد عبر مزود الشهادة أو certbot", "اضبط تجديداً تلقائياً دورياً", "راقب تواريخ الانتهاء"]}},
+    "SSL_EXPIRING": {
+        "en": {"title": "TLS certificate expiring soon", "cause": "Certificate expires within 30 days.",
+               "fix": "Renew now to avoid downtime.", "steps": ["Renew the certificate", "Verify auto-renewal works"]},
+        "ar": {"title": "شهادة TLS تنتهي قريباً", "cause": "الشهادة ستنتهي خلال 30 يوماً.",
+               "fix": "جدّدها الآن لتجنب الانقطاع.", "steps": ["جدّد الشهادة", "تحقق من عمل التجديد التلقائي"]}},
+    "MISSING_HSTS": {
+        "en": {"title": "Missing Strict-Transport-Security", "cause": "First visits can be downgraded to HTTP (SSL stripping).",
+               "fix": "Strict-Transport-Security: max-age=31536000; includeSubDomains", "steps": ["Add the header in your web server", "Start with a small max-age, then raise it", "Optionally add preload"]},
+        "ar": {"title": "غياب ترويسة Strict-Transport-Security", "cause": "الزيارة الأولى يمكن تخفيضها إلى HTTP (تجريد SSL).",
+               "fix": "Strict-Transport-Security: max-age=31536000; includeSubDomains", "steps": ["أضف الترويسة في خادم الويب", "ابدأ بمدة قصيرة ثم زدها", "أضف preload اختيارياً"]}},
+    "NO_CSP": {
+        "en": {"title": "Missing Content-Security-Policy", "cause": "No CSP limits script sources, increasing XSS impact.",
+               "fix": "Content-Security-Policy: default-src 'self'; script-src 'self'", "steps": ["Deploy CSP in report-only mode first", "Fix violations", "Enforce the policy"]},
+        "ar": {"title": "غياب سياسة أمان المحتوى CSP", "cause": "لا توجد سياسة تحدد مصادر السكربتات، ما يزيد أثر هجمات XSS.",
+               "fix": "Content-Security-Policy: default-src 'self'; script-src 'self'", "steps": ["طبّق السياسة بوضع Report-Only أولاً", "عالج المخالفات", "فرض السياسة نهائياً"]}},
+    "XFO_MISSING": {
+        "en": {"title": "Missing X-Frame-Options", "cause": "Clickjacking risk: the page can be embedded in iframes.",
+               "fix": "X-Frame-Options: DENY  (or use CSP frame-ancestors)", "steps": ["Add the header", "Prefer 'frame-ancestors' in CSP for modern support"]},
+        "ar": {"title": "غياب ترويسة X-Frame-Options", "cause": "خطر clickjacking: يمكن تضمين الصفحة داخل إطارات.",
+               "fix": "X-Frame-Options: DENY (أو استخدم CSP frame-ancestors)", "steps": ["أضف الترويسة", "فضّل frame-ancestors ضمن CSP للمتصفحات الحديثة"]}},
+    "XCTO_MISSING": {
+        "en": {"title": "Missing X-Content-Type-Options", "cause": "MIME sniffing may reinterpret files as executable.",
+               "fix": "X-Content-Type-Options: nosniff", "steps": ["Add the header to all responses"]},
+        "ar": {"title": "غياب ترويسة X-Content-Type-Options", "cause": "قد يعيد المتصفح تفسير نوع الملفات وينفذها.",
+               "fix": "X-Content-Type-Options: nosniff", "steps": ["أضف الترويسة لكل الاستجابات"]}},
+    "REFERRER_MISSING": {
+        "en": {"title": "Missing Referrer-Policy", "cause": "Full URLs may leak to third parties.",
+               "fix": "Referrer-Policy: strict-origin-when-cross-origin", "steps": ["Add the header"]},
+        "ar": {"title": "غياب سياسة Referrer-Policy", "cause": "قد تتسرب روابط كاملة إلى جهات خارجية.",
+               "fix": "Referrer-Policy: strict-origin-when-cross-origin", "steps": ["أضف الترويسة"]}},
+    "PERMISSIONS_MISSING": {
+        "en": {"title": "Missing Permissions-Policy", "cause": "Browser features (camera, geolocation) are not restricted.",
+               "fix": "Permissions-Policy: camera=(), geolocation=()", "steps": ["Add the header with allowed origins per feature"]},
+        "ar": {"title": "غياب سياسة Permissions-Policy", "cause": "ميزات المتصفح (كاميرا، موقع جغرافي) غير مقيّدة.",
+               "fix": "Permissions-Policy: camera=(), geolocation=()", "steps": ["أضف الترويسة مع تحديد المصادر المسموحة لكل ميزة"]}},
+    "SERVER_VERSION": {
+        "en": {"title": "Server header leaks version", "cause": "Attackers can fingerprint your stack.",
+               "fix": "server_tokens off;  # nginx (or equivalent)", "steps": ["Disable version exposure in your server config"]},
+        "ar": {"title": "ترويسة Server تكشف الإصدار", "cause": "يساعد المهاجمين على تحديد تقنياتك.",
+               "fix": "server_tokens off; # في nginx أو ما يعادلها", "steps": ["عطّل كشف الإصدار في إعداد الخادم"]}},
+    "XPOWERED_BY": {
+        "en": {"title": "X-Powered-By header present", "cause": "Reveals framework/technology.",
+               "fix": "Disable it (e.g. app.disable('x-powered-by') in Express)", "steps": ["Remove the header"]},
+        "ar": {"title": "ترويسة X-Powered-By ظاهرة", "cause": "تكشف إطار العمل المستخدم.",
+               "fix": "عطّلها (مثل app.disable('x-powered-by') في Express)", "steps": ["احذف الترويسة"]}},
+    "COOKIE_NO_SECURE": {
+        "en": {"title": "Cookie without Secure flag", "cause": "Cookie can be sent over plain HTTP.",
+               "fix": "Set-Cookie: session=...; Secure; HttpOnly; SameSite=Lax", "steps": ["Add the Secure attribute to all sensitive cookies"]},
+        "ar": {"title": "كوكي بدون خاصية Secure", "cause": "يمكن إرسال الكوكي عبر HTTP غير المشفر.",
+               "fix": "Set-Cookie: session=...; Secure; HttpOnly; SameSite=Lax", "steps": ["أضف خاصية Secure لكل الكوكيز الحساسة"]}},
+    "COOKIE_NO_HTTPONLY": {
+        "en": {"title": "Cookie without HttpOnly", "cause": "JavaScript (and XSS payloads) can read the cookie.",
+               "fix": "Add ; HttpOnly to session cookies.", "steps": ["Enable HttpOnly on all session cookies"]},
+        "ar": {"title": "كوكي بدون HttpOnly", "cause": "يمكن لجافاسكربت (وحمولات XSS) قراءة الكوكي.",
+               "fix": "أضف ; HttpOnly لكوكيز الجلسة.", "steps": ["فعّل HttpOnly على كل كوكيز الجلسة"]}},
+    "COOKIE_NO_SAMESITE": {
+        "en": {"title": "Cookie without SameSite", "cause": "Higher exposure to CSRF.",
+               "fix": "Add ; SameSite=Lax (or Strict).", "steps": ["Set SameSite explicitly"]},
+        "ar": {"title": "كوكي بدون SameSite", "cause": "يزيد احتمال هجمات CSRF.",
+               "fix": "أضف ; SameSite=Lax أو Strict.", "steps": ["حدد SameSite صراحةً"]}},
+    "CORS_WILDCARD": {
+        "en": {"title": "CORS allows any origin", "cause": "Any website can read API responses from a user's browser.",
+               "fix": "Access-Control-Allow-Origin: https://your-trusted-origin.com", "steps": ["Whitelist explicit origins", "Never combine '*' with credentials"]},
+        "ar": {"title": "CORS يسمح بأي أصل", "cause": "أي موقع يستطيع قراءة استجابات الـ API من متصفح المستخدم.",
+               "fix": "Access-Control-Allow-Origin: https://origin-موثوق.com", "steps": ["ضع قائمة أصول صريحة", "لا تجمع '*' مع السماح بالبيانات السرية أبداً"]}},
+    "CORS_REFLECT": {
+        "en": {"title": "CORS reflects arbitrary origins", "cause": "The server echoes any Origin header it receives.",
+               "fix": "Validate the Origin against an allowlist before reflecting it.", "steps": ["Check Origin against a whitelist", "Reject unknown origins"]},
+        "ar": {"title": "CORS يعكس أي أصل", "cause": "الخادم يردد أي قيمة Origin يتلقاها.",
+               "fix": "تحقق من الأصل مقابل قائمة مسموحة قبل عكسه.", "steps": ["قارن الأصل بالقائمة البيضاء", "ارفض الأصول غير المعروفة"]}},
+    "BROKEN_LINK": {
+        "en": {"title": "Broken link", "cause": "The target returns an error or does not respond.",
+               "fix": "Fix or remove the link.", "steps": ["Update the href", "Add redirects for moved pages"]},
+        "ar": {"title": "رابط معطل", "cause": "الهدف يعيد خطأ أو لا يستجيب.",
+               "fix": "أصلح الرابط أو احذفه.", "steps": ["حدّث قيمة href", "أضف توجيهات للصفحات المنقولة"]}},
+    "BROKEN_ASSET": {
+        "en": {"title": "Broken asset", "cause": "JS/CSS/image fails to load.",
+               "fix": "Fix the asset path or restore the file.", "steps":
+
+ import io
+from datetime import datetime, timezone
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+SEV_COLORS = {
+    "critical": colors.HexColor("#ef4444"),
+    "high": colors.HexColor("#f97316"),
+    "medium": colors.HexColor("#eab308"),
+    "low": colors.HexColor("#3b82f6"),
+    "performance": colors.HexColor("#8b5cf6"),
+    "code_quality": colors.HexColor("#64748b"),
+}
+
+def build_report(scan, findings) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                           leftMargin=2 * cm, rightMargin=2 * cm,
+                           topMargin=2 * cm, bottomMargin=2 * cm)
+    styles = getSampleStyleSheet()
+    story = [
+        Paragraph("CodeDoctor AI — Scan Report", styles["Title"]),
+        Paragraph(f"Target: {scan.url or 'Source code upload'}", styles["Normal"]),
+        Paragraph(f"Scan type: {scan.scan_type} | Date: "
+                  f"{(scan.finished_at or datetime.now(timezone.utc)).strftime('%Y-%m-%d %H:%M UTC')}",
+                  styles["Normal"]),
+        Spacer(1, 12),
+    ]
+
+scores = Table([
+        ["Security Score", "Quality Score", "Overall Score"],
+        [f"{scan.security_score}/100", f"{scan.quality_score}/100", f"{scan.overall_score}/100"],
+    ], colWidths=[5.6 * cm] * 3)
+    scores.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("FONTSIZE", (0, 0), (-1, -1), 12),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+    ]))
+    story += [scores, Spacer(1, 18),
+              Paragraph("Findings (grouped by severity)", styles["Heading2"]), Spacer(1, 6)]
+
+grouped = {}
+    for f in findings:
+        grouped.setdefault(f.severity, []).append(f)
+
+for sev in ("critical", "high", "medium", "low"):
+        for f in grouped.get(sev, []):
+            story.append(Paragraph(
+                f'<font color="{SEV_COLORS[sev].hexval()}">[{sev.upper()}]</font> '
+                f"<b>{f.code}</b> — {f.location}", styles["Normal"]))
+            story.append(Paragraph(f"Evidence: {f.evidence}", styles["Italic"]))
+            story.append(Spacer(1, 8))
+
+for ftype in ("performance", "code_quality"):
+        for f in grouped_by_type(findings, ftype):
+            story.append(Paragraph(
+                f'<font color="{SEV_COLORS[ftype].hexval()}">[{ftype}]</font> '
+                f"<b>{f.code}</b> — {f.location}", styles["Normal"]))
+            story.append(Paragraph(f"Evidence: {f.evidence}", styles["Italic"]))
+            story.append(Spacer(1, 8))
+
+if not findings:
+        story.append(Paragraph("No findings detected. Note: a clean report does not "
+                               "guarantee the absence of vulnerabilities.", styles["Normal"]))
+    story.append(Spacer(1, 16))
+    story.append(Paragraph(
+        "Disclaimer: CodeDoctor AI performs passive, non-destructive checks only. "
+        "Passing these checks does not guarantee full security.",
+        styles["Italic"]))
+    doc.build(story)
+    return buf.getvalue()
+
+def grouped_by_type(findings, ftype):
+    return [f for f in findings if f.ftype == ftype]
+import os
+import tempfile
+from collections import Counter
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app import models, schemas
+from app.ai_assistant import explain
+from app.auth import router as auth_router, get_current_user, hash_password  # noqa: F401
+from app.database import SessionLocal, init_db
+from app.models import User, Scan, Finding
+from app.report_pdf import build_report
+from app.scanner.engine import run_web_scan, run_code_scan
+
+app = FastAPI(title="CodeDoctor AI", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("FRONTEND_URL", "http://localhost:5173")],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+app.include_router(auth_router)
+
+def db_session():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+def scan_to_out(scan: Scan) -> schemas.ScanOut:
+    return schemas.ScanOut(
+        id=scan.id, scan_type=scan.scan_type, url=scan.url, status=scan.status,
+        security_score=scan.security_score, quality_score=scan.quality_score,
+        overall_score=scan.overall_score, error=scan.error,
+        created_at=scan.created_at.isoformat(),
+        finished_at=scan.finished_at.isoformat() if scan.finished_at else None,
+    )
+
+def own_scan(scan_id: int, user: User, db: Session) -> Scan:
+    scan = db.get(Scan, scan_id)
+    if not scan or scan.user_id != user.id:
+        raise HTTPException(404, "Scan not found")
+    return scan
+
+# ---------- المشاريع والفحص ----------
+@app.get("/scans", response_model=list[schemas.ScanOut])
+def list_scans(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
+    return [scan_to_out(s) for s in db.query(Scan).filter(Scan.user_id == user.id)
+            .order_by(Scan.created_at.desc()).all()]
+
+@app.post("/scans", response_model=schemas.ScanOut, status_code=201)
+def create_scan(data: schemas.ScanIn, background: BackgroundTasks,
+                user: User = Depends(get_current_user), db:
+
+{
+  "name": "codedoctor-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0",
+    "recharts": "^2.15.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.5"
+  }
+}
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: { port: 5173 },
+});
+import React from "react";
+import ReactDOM from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App.jsx";
+import "./styles.css";
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>
+);
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+function token() {
+  return localStorage.getItem("cd_token") || "";
+}
+
+async function req(path, opts = {}) {
+  const res = await fetch(`${API}${path}`, {
+    ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token()}`,
+      ...(opts.headers || {}),
+    },
+  });
+  if (res.status === 401) {
+    localStorage.removeItem("cd_token");
+    window.location.href = "/login";
+  }
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || res.statusText);
+  return res.json();
+}
+
+export const api = {
+  register: (email, password) =>
+    req("/auth/register", { method: "POST", body: JSON.stringify({ email, password }) }),
+  login: (email, password) =>
+    req("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
+  listScans: () => req("/scans"),
+  createScan: (url) =>
+    req("/scans", { method: "POST", body: JSON.stringify({ url, confirm_ownership: true }) }),
+  getScan: (id) => req(`/scans/${id}`),
+  getFindings: (id) => req(`/scans/${id}/findings`),
+  getLogs: (id) => req(`/scans/${id}/logs`),
+  compare: (a, b) => req(`/scans/${a}/compare/${b}`),
+  explain: (findingId, lang) =>
+    req("/ai/explain", { method: "POST", body: JSON.stringify({ finding_id: findingId, lang }) }),
+  uploadZip: (file) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return fetch(`${API}/analysis/upload`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token()}` },
+      body: fd,
+    }).then((r) => {
+      if (!r.ok) throw new Error("Upload failed");
+      return r.json();
+    });
+  },
+  reportUrl: (id) => `${API}/scans/${id}/report?token=${token()}`,
+};
+import React, { createContext, useContext, useEffect, useState } from "react";
+
+const DICT = {
+  ar: {
+    brand: "CodeDoctor AI", login: "تسجيل الدخول", register: "إنشاء حساب",
+    email: "البريد الإلكتروني", password: "كلمة المرور", dashboard: "لوحة التحكم",
+    newScan: "فحص جديد", uploadCode: "تحليل كود", results: "النتائج", logout: "خروج",
+    targetUrl: "رابط الموقع أو التطبيق", startScan: "بدء الفحص",
+    ownership: "أُقر بأنني أملك هذا الموقع أو أملك تصريحاً صريحاً بفحصه",
+    scans: "الفحوصات", securityScore: "درجة الأمان", qualityScore: "درجة الجودة",
+    overallScore: "الدرجة العامة", critical: "حرجة", high: "عالية الخطورة",
+    medium: "متوسطة", low: "منخفضة", performance: "الأداء", codeQuality: "جودة الكود",
+    pdfReport: "تقرير PDF", compare: "مقارنة", explain: "شرح المساعد الذكي",
+    cause: "السبب", fix: "الكود المصحح", steps: "خطوات التطبيق", location: "الموقع",
+    evidence: "الدليل", noFindings: "لا نتائج. ملاحظة: خلوّ التقرير لا يضمن غياب الثغرات.",
+    running: "جارٍ الفحص…", queued: "في الانتظار…", completed: "مكتمل", failed: "فشل",
+    uploadHint: "ارفع ملف .zip يحتوي كود مشروعك لتحليل جودته وأمانه.",
+    scanTypeWeb: "فحص موقع", scanTypeCode: "تحليل كود", severityChart: "توزيع النتائج",
+    limits: "الفحص سلبي وغير تخريبي ولا يضمن اكتشاف جميع الثغرات.",
+  },
+  en: {
+    brand: "CodeDoctor AI", login: "Login", register: "Register",
+    email: "Email", password: "Password", dashboard: "Dashboard",
+    newScan: "New Scan", uploadCode: "Code Analysis", results: "Results", logout: "Logout",
+    targetUrl: "Website / app URL", startScan: "Start Scan",
+    ownership: "I confirm I own this site or am authorized to scan it",
+    scans: "Scans", securityScore: "Security Score", qualityScore: "Quality Score",
+    overallScore: "Overall Score", critical: "Critical", high: "High",
+    medium: "Medium", low: "Low", performance: "Performance", codeQuality: "Code Quality",
+    pdfReport: "PDF Report", compare: "Compare", explain: "AI Assistant",
+    cause: "Root cause", fix: "Suggested fix", steps: "How to apply", location: "Location",
+    evidence: "Evidence", noFindings: "No findings. Note: a clean report does not guarantee absence of vulnerabilities.",
+    running: "Scanning…", queued: "Queued…", completed: "Completed", failed: "Failed",
+    uploadHint: "Upload a .zip of your project source to analyze quality and safety.",
+    scanTypeWeb: "Web scan", scanTypeCode: "Code analysis", severityChart: "Findings distribution",
+    limits: "Scanning is passive and non-destructive. It does not guarantee finding all vulnerabilities.",
+  },
+};
+
+const I18nCtx = createContext(null);
+export const useI18n = () => useContext(I18nCtx);
+
+export function I18nProvider({ children }) {
+  const [lang, setLang] = useState(localStorage.getItem("cd_lang") || "ar");
+  useEffect(() => {
+    localStorage.setItem("cd_lang", lang);
+    document.documentElement.lang = lang;
+    document.documentElement.dir = lang === "ar" ? "rtl" : "ltr";
+  }, [lang]);
+  const t = (k) => DICT[lang][k] ?? k;
+  return (
+    <I18nCtx.Provider value={{ lang, setLang, t, isAr: lang === "ar" }}>
+      {children}
+    </I18nCtx.Provider>
+  );
+}
+import React, { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { api } from "../api.js";
+import { useI18n } from "../i18n.jsx";
+
+export default function Auth() {
+  const { t } = useI18n();
+  const nav = useNavigate();
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [err, setErr] = useState("");
+
+const submit = async (e) => {
+    e.preventDefault();
+    setErr("");
+    try {
+      const fn = mode === "login" ? api.login : api.register;
+      const { access_token } = await fn(email, password);
+      localStorage.setItem("cd_token", access_token);
+      nav("/");
+    } catch (ex) { setErr(ex.message); }
+  };
+
+return (
+    <div className="card auth-card">
+      <div className="tabs">
+        <button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>{t("login")}</button>
+        <button className={mode === "register" ? "active" : ""} onClick={() => setMode("register")}>{t("register")}</button>
+      </div>
+      <form onSubmit={submit}>
+        <label>{t("email")}</label>
+        <input type="email" dir="ltr" value={email} onChange={(e) => setEmail(e.target.value)} required />
+        <label>{t("password")}</label>
+        <input type="password" dir="ltr" minLength={8} value={password}
+               onChange={(e) => setPassword(e.target.value)} required />
+        {err && <p className="err">{err}</p>}
+        <button className="primary" type="submit">{mode === "login" ? t("login") : t("register")}</button>
+      </form>
+    </div>
+  );
+}
+import React, { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { api } from "../api.js";
+import { useI18n } from "../i18n.jsx";
+
+export default function Dashboard() {
+  const { t, lang } = useI18n();
+  const [scans, setScans] = useState([]);
+  const [latest, setLatest] = useState(null);
+  const [findings, setFindings] = useState([]);
+
+useEffect(() => {
+    api.listScans().then(async (rows) => {
+      setScans(rows);
+      if (rows[0]?.status === "completed") {
+        setLatest(rows[0]);
+        setFindings(await api.getFindings(rows[0].id));
+      }
+    }).catch(() => {});
+  }, []);
+
+const sevKey = (s) => ({ critical: t("critical"), high: t("high"), medium: t("medium"),
+                           low: t("low"), performance: t("performance") });
+  const chartData = Object.entries(
+    findings.reduce((acc, f) => ((acc[f.severity] = (acc[f.severity] || 0) + 1), acc), {})
+  ).map(([sev, count]) => ({ name: sevKey()[sev] || sev, count }));
+
+return (
+    <div>
+      <h2>{t("scans")}</h2>
+      {latest && (
+        <div className="scores">
+          <ScoreCard label={t("securityScore")} value={latest.security_score} color="#22c55e" />
+          <ScoreCard label={t("qualityScore")} value={latest.quality_score} color="#38bdf8" />
+          <ScoreCard label={t("overallScore")} value={latest.overall_score} color="#a78bfa" />
+        </div>
+      )}
+      {chartData.length > 0 && (
+        <div className="card chart-card">
+          <h3>{t("severityChart")}</h3>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={chartData}>
+              <XAxis dataKey="name" stroke="#94a3b8" />
+              <YAxis allowDecimals={false} stroke="#94a3b8" />
+              <Tooltip contentStyle={{ background: "#1e293b", border: "none" }} />
+              <Bar dataKey="count" fill="#22c55e" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+      <table className="table">
+        <thead><tr><th>ID</th><th>{t("targetUrl")}</th><th>{t("results")}</th><th>{t("overallScore")}</th><th></th></tr></thead>
+        <tbody>
+          {scans.map((s) => (
+            <tr key={s.id}>
+              <td>{s.id}</td>
+              <td dir="ltr">{s.url || t("scanTypeCode")}</td>
+              <td>{t(s.status)}</td>
+              <td>{s.overall_score}</td>
+              <td><Link to=
